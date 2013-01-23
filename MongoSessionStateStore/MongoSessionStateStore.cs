@@ -277,14 +277,9 @@ namespace MongoSessionStateStore
                 {
                     WriteToEventLog(e, "SetAndReleaseItemExclusive");
                     throw new ProviderException(_exceptionMessage);
-                }
-                else
-                    throw e;
-            }
-            finally
-            {
-                conn.Disconnect();
-            }
+                }                
+                throw;
+            }          
         }        
 
         /// <summary>
@@ -439,13 +434,9 @@ namespace MongoSessionStateStore
                     WriteToEventLog(e, "GetSessionStoreItem");
                     throw new ProviderException(_exceptionMessage);
                 }
-                else
-                    throw e;
-            }
-            finally
-            {
-                conn.Disconnect();
-            }
+             
+                throw;
+            }            
 
             return item;
         }
@@ -505,13 +496,9 @@ namespace MongoSessionStateStore
                     WriteToEventLog(e, "CreateUninitializedItem");
                     throw new ProviderException(_exceptionMessage);
                 }
-                else
-                    throw e;
-            }
-            finally
-            {
-                conn.Disconnect();
-            }
+             
+                throw;
+            }            
         }
 
         /// <summary>
@@ -560,7 +547,6 @@ namespace MongoSessionStateStore
             var update = Update.Set("Locked", false);
             update.Set("Expires", DateTime.Now.AddMinutes(_config.Timeout.TotalMinutes).ToUniversalTime());            
             
-
             try
             {
                 sessionCollection.Update(query, update, _safeMode);
@@ -572,13 +558,8 @@ namespace MongoSessionStateStore
                     WriteToEventLog(e, "ReleaseItemExclusive");
                     throw new ProviderException(_exceptionMessage);
                 }
-                else
-                    throw e;
-            }
-            finally
-            {
-                conn.Disconnect();
-            }
+                throw;
+            }            
         }
 
         public override void RemoveItem(System.Web.HttpContext context, string id, object lockId, SessionStateStoreData item)
@@ -599,13 +580,9 @@ namespace MongoSessionStateStore
                     WriteToEventLog(e, "RemoveItem");
                     throw new ProviderException(_exceptionMessage);
                 }
-                else
-                    throw e;
-            }
-            finally
-            {
-                conn.Disconnect();
-            }
+                
+                throw;
+            }            
         }
 
         public override void ResetItemTimeout(System.Web.HttpContext context, string id)
@@ -626,12 +603,7 @@ namespace MongoSessionStateStore
                     WriteToEventLog(e, "ResetItemTimeout");
                     throw new ProviderException(_exceptionMessage);
                 }
-                else
-                    throw e;
-            }
-            finally
-            {
-                conn.Disconnect();
+                throw;
             }
         }       
     }
