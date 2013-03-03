@@ -1,7 +1,5 @@
 ﻿using System;
-using System.Collections.Generic;
-using System.Linq;
-using System.Text;
+using System.Globalization;
 using System.Web.SessionState;
 using System.Configuration;
 using System.Configuration.Provider;
@@ -71,18 +69,21 @@ namespace MongoSessionStateStore
     ///     </sessionState>
     ///     ...
     /// </system.web>
+    /// replicasToWrite setting is interpreted as the number of replicas to write to, in addition to the primary (in a replicaset environment).
+    /// i.e. replicasToWrite = 0, will wait for the response from writing to the primary node. > 0 will wait for the response having written to 
+    /// ({replicasToWrite} + 1) nodes
     /// </summary>
     public sealed class MongoSessionStateStore : SessionStateStoreProviderBase
     {
-        private SessionStateSection _config = null;
+        private SessionStateSection _config;
         private ConnectionStringSettings _connectionStringSettings;
         private string _applicationName;
         private string _connectionString;
         private bool _writeExceptionsToEventLog;
-        private const string _exceptionMessage = "An exception occurred. Please contact your administrator.";
-        private const string _eventSource = "MongoSessionStateStore";
-        private const string _eventLog = "Application";
-        private SafeMode _safeMode = null;
+        private const string ExceptionMessage = "An exception occurred. Please contact your administrator.";
+        private const string EventSource = "MongoSessionStateStore";
+        private const string EventLog = "Application";        
+        private WriteConcern _writeConcern;
 
         /// <summary>
         /// The ApplicationName property is used to differentiate sessions
@@ -120,7 +121,8 @@ namespace MongoSessionStateStore
         /// <returns>MongoServer</returns>
         private MongoServer GetConnection()
         {
-            return MongoServer.Create(_connectionString);
+            var client = new MongoClient(_connectionString);
+            return client.GetServer();
         }
 
         /// <summary>
@@ -134,7 +136,7 @@ namespace MongoSessionStateStore
             if (config == null)
                 throw new ArgumentNullException("config");
 
-            if (name == null || name.Length == 0)
+            if (name.Length == 0)
                 name = "MongoSessionStateStore";
 
             if (String.IsNullOrEmpty(config["description"]))
@@ -172,9 +174,11 @@ namespace MongoSessionStateStore
                     _writeExceptionsToEventLog = true;
             }
 
-            // Initialise safe mode options. Defaults to Safe Mode=true, fsynch=false, w=0 (replicas to write to before returning)
-            bool safeModeEnabled = true;            
-            
+            // Initialise WriteConcern options. 
+            // Defaults to fsynch=false, w=1 (Provides acknowledgment of write operations on a standalone mongod or the primary in a replica set.)
+            // replicasToWrite config item comes into use when > 0. This translates to the WriteConcern wValue, by adding 1 to it.
+            // e.g. replicasToWrite = 1 is taken as meaning "I want to wait for write operations to be acknowledged at the primary + {replicasToWrite} replicas"
+            // MongoDB C# Driver references on WriteConcern : http://docs.mongodb.org/manual/core/write-operations/#write-concern
             bool fsync = false;
             if (config["fsync"] != null)
             {
@@ -182,17 +186,25 @@ namespace MongoSessionStateStore
                     fsync = true;
             }
 
-            int replicasToWrite = 0;
+            int replicasToWrite = 1;
             if (config["replicasToWrite"] != null)
             {
                 if (!int.TryParse(config["replicasToWrite"], out replicasToWrite))
                     throw new ProviderException("Replicas To Write must be a valid integer");
             }
-            
-            _safeMode = SafeMode.Create(safeModeEnabled, fsync, replicasToWrite);
+
+            string wValue = "1";
+            if (replicasToWrite > 0)
+                wValue = (1 + replicasToWrite).ToString(CultureInfo.InvariantCulture);
+
+            _writeConcern = new WriteConcern
+                {
+                    FSync = fsync,
+                    W = WriteConcern.WValue.Parse(wValue)
+                };            
         }
         
-        public override SessionStateStoreData CreateNewStoreData(System.Web.HttpContext context, int timeout)
+        public override SessionStateStoreData CreateNewStoreData(HttpContext context, int timeout)
         {
             return new SessionStateStoreData(new SessionStateItemCollection(),
                 SessionStateUtility.GetSessionStaticObjects(context),
@@ -214,8 +226,8 @@ namespace MongoSessionStateStore
         /// </summary>
         private string Serialize(SessionStateItemCollection items)
         {
-            using(MemoryStream ms = new MemoryStream())
-            using (BinaryWriter writer = new BinaryWriter(ms))
+            using(var ms = new MemoryStream())
+            using (var writer = new BinaryWriter(ms))
             {
                 if (items != null)
                     items.Serialize(writer);
@@ -239,36 +251,37 @@ namespace MongoSessionStateStore
             string sessItems = Serialize((SessionStateItemCollection)item.Items);
 
             MongoServer conn = GetConnection();
-            MongoCollection sessionCollection = GetSessionCollection(conn);                        
-            BsonDocument insertDoc = null;
+            MongoCollection sessionCollection = GetSessionCollection(conn);
 
             try
             {
                 if (newItem)
                 {
-                    insertDoc = new BsonDocument();
-                    insertDoc.Add("_id", id);
-                    insertDoc.Add("ApplicationName", ApplicationName);
-                    insertDoc.Add("Created", DateTime.Now.ToUniversalTime());
-                    insertDoc.Add("Expires", DateTime.Now.AddMinutes((Double)item.Timeout).ToUniversalTime());
-                    insertDoc.Add("LockDate", DateTime.Now.ToUniversalTime());
-                    insertDoc.Add("LockId", 0);
-                    insertDoc.Add("Timeout", item.Timeout);
-                    insertDoc.Add("Locked", false);
-                    insertDoc.Add("SessionItems", sessItems);
-                    insertDoc.Add("Flags", 0);                
+                    var insertDoc = new BsonDocument
+                        {
+                            {"_id", id},
+                            {"ApplicationName", ApplicationName},
+                            {"Created", DateTime.Now.ToUniversalTime()},
+                            {"Expires", DateTime.Now.AddMinutes(item.Timeout).ToUniversalTime()},
+                            {"LockDate", DateTime.Now.ToUniversalTime()},
+                            {"LockId", 0},
+                            {"Timeout", item.Timeout},
+                            {"Locked", false},
+                            {"SessionItems", sessItems},
+                            {"Flags", 0}
+                        };
 
                     var query = Query.And(Query.EQ("_id", id), Query.EQ("ApplicationName", ApplicationName), Query.LT("Expires", DateTime.Now.ToUniversalTime()));
-                    sessionCollection.Remove(query, _safeMode); 
-                    sessionCollection.Insert(insertDoc, _safeMode);
+                    sessionCollection.Remove(query, _writeConcern);
+                    sessionCollection.Insert(insertDoc, _writeConcern);
                 }
                 else
                 {
                     var query = Query.And(Query.EQ("_id", id), Query.EQ("ApplicationName", ApplicationName), Query.EQ("LockId", (Int32)lockId));
-                    var update = Update.Set("Expires", DateTime.Now.AddMinutes((Double)item.Timeout).ToUniversalTime());
+                    var update = Update.Set("Expires", DateTime.Now.AddMinutes(item.Timeout).ToUniversalTime());
                     update.Set("SessionItems", sessItems);
                     update.Set("Locked", false);
-                    sessionCollection.Update(query, update, _safeMode);
+                    sessionCollection.Update(query, update, _writeConcern);
                 }
             }
             catch (Exception e)
@@ -276,7 +289,7 @@ namespace MongoSessionStateStore
                 if (WriteExceptionsToEventLog)
                 {
                     WriteToEventLog(e, "SetAndReleaseItemExclusive");
-                    throw new ProviderException(_exceptionMessage);
+                    throw new ProviderException(ExceptionMessage);
                 }                
                 throw;
             }          
@@ -336,7 +349,6 @@ namespace MongoSessionStateStore
             MongoCollection sessionCollection = GetSessionCollection(conn);
             
             // DateTime to check if current session item is expired.
-            DateTime expires;
             // String to hold serialized SessionStateItemCollection.
             string serializedItems = "";
             // True if a record is found in the database.
@@ -345,29 +357,21 @@ namespace MongoSessionStateStore
             bool deleteData = false;
             // Timeout value from the data store.
             int timeout = 0;
-            QueryComplete query;
+
             try
             {                
                 // lockRecord is true when called from GetItemExclusive and
                 // false when called from GetItem.
                 // Obtain a lock if possible. Ignore the record if it is expired.
+                IMongoQuery query;
                 if (lockRecord)
                 {
                     query = Query.And(Query.EQ("_id", id), Query.EQ("ApplicationName", ApplicationName), Query.EQ("Locked", false), Query.GT("Expires", DateTime.Now.ToUniversalTime()));
                     var update = Update.Set("Locked", true);
                     update.Set("LockDate", DateTime.Now.ToUniversalTime());
-                    var result = sessionCollection.Update(query, update, _safeMode);
-                    
-                    if (result.DocumentsAffected == 0)
-                    {
-                        // No record was updated because the record was locked or not found.
-                        locked = true;
-                    }
-                    else
-                    {
-                        // The record was updated.
-                        locked = false;
-                    }
+                    var result = sessionCollection.Update(query, update, _writeConcern);
+
+                    locked = result.DocumentsAffected == 0; // DocumentsAffected == 0 == No record was updated because the record was locked or not found.
                 }
 
                 // Retrieve the current session item information.
@@ -376,7 +380,7 @@ namespace MongoSessionStateStore
                 
                 if (results != null)
                 {
-                    expires = results["Expires"].AsDateTime;
+                    DateTime expires = results["Expires"].AsDateTime;
 
                     if (expires < DateTime.Now.ToUniversalTime())
                     {
@@ -400,7 +404,7 @@ namespace MongoSessionStateStore
                 if (deleteData)
                 {
                     query = Query.And(Query.EQ("_id", id), Query.EQ("ApplicationName", ApplicationName));
-                    sessionCollection.Remove(query, _safeMode);
+                    sessionCollection.Remove(query, _writeConcern);
                 }
 
                 // The record was not found. Ensure that locked is false.
@@ -417,14 +421,13 @@ namespace MongoSessionStateStore
                     query = Query.And(Query.EQ("_id", id), Query.EQ("ApplicationName", ApplicationName));
                     var update = Update.Set("LockId", (int)lockId);
                     update.Set("Flags", 0);
-                    sessionCollection.Update(query, update, _safeMode);                    
+                    sessionCollection.Update(query, update, _writeConcern);                    
 
                     // If the actionFlags parameter is not InitializeItem, 
                     // deserialize the stored SessionStateItemCollection.
-                    if (actionFlags == SessionStateActions.InitializeItem)
-                        item = CreateNewStoreData(context, (int)_config.Timeout.TotalMinutes);
-                    else
-                        item = Deserialize(context, serializedItems, timeout);
+                    item = actionFlags == SessionStateActions.InitializeItem 
+                        ? CreateNewStoreData(context, (int)_config.Timeout.TotalMinutes) 
+                        : Deserialize(context, serializedItems, timeout);
                 }
             }
             catch (Exception e)
@@ -432,7 +435,7 @@ namespace MongoSessionStateStore
                 if (WriteExceptionsToEventLog)
                 {
                     WriteToEventLog(e, "GetSessionStoreItem");
-                    throw new ProviderException(_exceptionMessage);
+                    throw new ProviderException(ExceptionMessage);
                 }
              
                 throw;
@@ -444,16 +447,16 @@ namespace MongoSessionStateStore
         private SessionStateStoreData Deserialize(HttpContext context,
          string serializedItems, int timeout)
         {
-            using (MemoryStream ms =
+            using (var ms =
               new MemoryStream(Convert.FromBase64String(serializedItems)))
             {
 
-                SessionStateItemCollection sessionItems =
+                var sessionItems =
                   new SessionStateItemCollection();
 
                 if (ms.Length > 0)
                 {
-                    using (BinaryReader reader = new BinaryReader(ms))
+                    using (var reader = new BinaryReader(ms))
                     {
                         sessionItems = SessionStateItemCollection.Deserialize(reader);
                     }
@@ -465,25 +468,27 @@ namespace MongoSessionStateStore
             }
         }
 
-        public override void CreateUninitializedItem(System.Web.HttpContext context, string id, int timeout)
+        public override void CreateUninitializedItem(HttpContext context, string id, int timeout)
         {
             MongoServer conn = GetConnection();
             MongoCollection sessionCollection = GetSessionCollection(conn);
-            BsonDocument doc = new BsonDocument();
-            doc.Add("_id", id);
-            doc.Add("ApplicationName", ApplicationName);
-            doc.Add("Created", DateTime.Now.ToUniversalTime());
-            doc.Add("Expires", DateTime.Now.AddMinutes((Double)timeout).ToUniversalTime());
-            doc.Add("LockDate", DateTime.Now.ToUniversalTime());
-            doc.Add("LockId", 0);
-            doc.Add("Timeout", timeout);
-            doc.Add("Locked", false);
-            doc.Add("SessionItems", "");
-            doc.Add("Flags", 1);                       
+            var doc = new BsonDocument
+                {
+                    {"_id", id},
+                    {"ApplicationName", ApplicationName},
+                    {"Created", DateTime.Now.ToUniversalTime()},
+                    {"Expires", DateTime.Now.AddMinutes(timeout).ToUniversalTime()},
+                    {"LockDate", DateTime.Now.ToUniversalTime()},
+                    {"LockId", 0},
+                    {"Timeout", timeout},
+                    {"Locked", false},
+                    {"SessionItems", ""},
+                    {"Flags", 1}
+                };
 
             try 
-            { 
-                var result = sessionCollection.Insert(doc, _safeMode); 
+            {
+                var result = sessionCollection.Insert(doc, _writeConcern); 
                 if (!result.Ok)
                 {
                     throw new Exception(result.ErrorMessage);
@@ -494,7 +499,7 @@ namespace MongoSessionStateStore
                 if (WriteExceptionsToEventLog)
                 {
                     WriteToEventLog(e, "CreateUninitializedItem");
-                    throw new ProviderException(_exceptionMessage);
+                    throw new ProviderException(ExceptionMessage);
                 }
              
                 throw;
@@ -511,14 +516,14 @@ namespace MongoSessionStateStore
         /// </summary>
         private void WriteToEventLog(Exception e, string action)
         {
-            using (EventLog log = new EventLog())
+            using (var log = new EventLog())
             {
-                log.Source = _eventSource;
-                log.Log = _eventLog;
+                log.Source = EventSource;
+                log.Log = EventLog;
 
                 string message =
                   String.Format("An exception occurred communicating with the data source.\n\nAction: {0}\n\nException: {1}", 
-                  action, e.ToString());                
+                  action, e);                
 
                 log.WriteEntry(message);
             }
@@ -528,17 +533,17 @@ namespace MongoSessionStateStore
         {            
         }
 
-        public override void EndRequest(System.Web.HttpContext context)
+        public override void EndRequest(HttpContext context)
         {
             
         }       
 
-        public override void InitializeRequest(System.Web.HttpContext context)
+        public override void InitializeRequest(HttpContext context)
         {
             
         }
 
-        public override void ReleaseItemExclusive(System.Web.HttpContext context, string id, object lockId)
+        public override void ReleaseItemExclusive(HttpContext context, string id, object lockId)
         {
             MongoServer conn = GetConnection();
             MongoCollection sessionCollection = GetSessionCollection(conn);
@@ -549,20 +554,20 @@ namespace MongoSessionStateStore
             
             try
             {
-                sessionCollection.Update(query, update, _safeMode);
+                sessionCollection.Update(query, update, _writeConcern);
             }
             catch (Exception e)
             {
                 if (WriteExceptionsToEventLog)
                 {
                     WriteToEventLog(e, "ReleaseItemExclusive");
-                    throw new ProviderException(_exceptionMessage);
+                    throw new ProviderException(ExceptionMessage);
                 }
                 throw;
             }            
         }
 
-        public override void RemoveItem(System.Web.HttpContext context, string id, object lockId, SessionStateStoreData item)
+        public override void RemoveItem(HttpContext context, string id, object lockId, SessionStateStoreData item)
         {
             MongoServer conn = GetConnection();
             MongoCollection sessionCollection = GetSessionCollection(conn);
@@ -571,21 +576,21 @@ namespace MongoSessionStateStore
 
             try
             {
-                sessionCollection.Remove(query, _safeMode);
+                sessionCollection.Remove(query, _writeConcern);
             }
             catch (Exception e)
             {
                 if (WriteExceptionsToEventLog)
                 {
                     WriteToEventLog(e, "RemoveItem");
-                    throw new ProviderException(_exceptionMessage);
+                    throw new ProviderException(ExceptionMessage);
                 }
                 
                 throw;
             }            
         }
 
-        public override void ResetItemTimeout(System.Web.HttpContext context, string id)
+        public override void ResetItemTimeout(HttpContext context, string id)
         {
             MongoServer conn = GetConnection();
             MongoCollection sessionCollection = GetSessionCollection(conn);
@@ -594,14 +599,14 @@ namespace MongoSessionStateStore
 
             try
             {
-                sessionCollection.Update(query, update, _safeMode);
+                sessionCollection.Update(query, update, _writeConcern);
             }
             catch (Exception e)
             {
                 if (WriteExceptionsToEventLog)
                 {
                     WriteToEventLog(e, "ResetItemTimeout");
-                    throw new ProviderException(_exceptionMessage);
+                    throw new ProviderException(ExceptionMessage);
                 }
                 throw;
             }
